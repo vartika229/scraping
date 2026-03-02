@@ -52,14 +52,71 @@ def extract_email_from_website(page: Page, website_url: str) -> Optional[str]:
             pass
     return None
 
+def _dismiss_consent(page: Page):
+    """Dismiss Google consent / cookie dialogs that block the page on servers."""
+    consent_selectors = [
+        "button:has-text('Accept all')",
+        "button:has-text('Reject all')",
+        "button:has-text('I agree')",
+        "form[action*='consent'] button",
+        "button[aria-label='Accept all']",
+    ]
+    for sel in consent_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                random_delay(1, 2)
+                return
+        except Exception:
+            continue
+
+
+def _safe_text(page: Page, selectors: list, timeout: int = 3000) -> Optional[str]:
+    """Try multiple selectors in order, return the text of the first visible one."""
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=timeout):
+                text = el.inner_text().strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return None
+
+
+def _safe_attr(page: Page, selectors: list, attr: str, timeout: int = 3000) -> Optional[str]:
+    """Try multiple selectors in order, return an attribute of the first visible one."""
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=timeout):
+                val = el.get_attribute(attr)
+                if val:
+                    return val.strip()
+        except Exception:
+            continue
+    return None
+
+
 def extract_place_details(page: Page, url: str, extract_email: bool = False) -> Dict:
     """Extracts details from a single place listing."""
     logger.info(f"Extracting details for: {url}")
     try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.goto(url, wait_until="networkidle", timeout=45000)
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout while loading {url}, attempting to extract what is available.")
+
+    # Handle consent dialogs (common on server IPs, especially in Europe)
+    _dismiss_consent(page)
     random_delay(2, 4)
+
+    # Wait for the place panel to be present before extracting
+    try:
+        page.locator("h1").first.wait_for(state="visible", timeout=10000)
+    except Exception:
+        logger.warning("Place title did not appear in time, extracting what is available.")
 
     data = {
         "Company Name": None,
@@ -73,82 +130,122 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
         "Google Maps URL": url
     }
 
-    # Extract Company Name
-    try:
-        title_element = page.locator("h1.DUwDvf").first
-        if title_element.is_visible():
-            data["Company Name"] = title_element.inner_text()
-    except Exception:
-        pass
+    # ── Company Name ──────────────────────────────────────
+    data["Company Name"] = _safe_text(page, [
+        "h1.DUwDvf",
+        "h1[data-attrid='title']",
+        "div[role='main'] h1",
+        "h1",
+    ])
 
-    # Extract Rating and Reviews
+    # ── Rating ────────────────────────────────────────────
+    data["Rating"] = _safe_text(page, [
+        "div.F7nice > span > span[aria-hidden='true']",
+        "div.F7nice span[aria-hidden='true']",
+        "span.ceNzKf[role='img']",
+    ])
+    # Fallback: extract from aria-label like "4.6 stars 247889 Reviews"
+    if not data["Rating"]:
+        try:
+            role_img = page.locator("span[role='img'][aria-label*='stars']").first
+            if role_img.is_visible(timeout=2000):
+                label = role_img.get_attribute("aria-label") or ""
+                m = re.search(r'([\d.]+)\s*stars?', label, re.IGNORECASE)
+                if m:
+                    data["Rating"] = m.group(1)
+        except Exception:
+            pass
+
+    # ── Review Count ──────────────────────────────────────
     try:
-        # Rating usually has an aria-label like "4.7 stars" or is placed right next to reviews
-        rating_element = page.locator("div.F7nice > span > span[aria-hidden='true']").first
-        if rating_element.is_visible():
-            data["Rating"] = rating_element.inner_text()
-            
-        reviews_element = page.locator("div.F7nice span[aria-label*='reviews']").first
-        if reviews_element.is_visible():
-            text = reviews_element.inner_text().replace("(", "").replace(")", "").replace(",", "")
-            # Filter just numbers in case of extra text
-            nums = re.findall(r'\d+', text)
+        reviews_text = _safe_text(page, [
+            "div.F7nice span[aria-label*='reviews']",
+            "div.F7nice span[aria-label*='Reviews']",
+            "span[aria-label*='reviews']",
+        ])
+        if reviews_text:
+            cleaned = reviews_text.replace("(", "").replace(")", "").replace(",", "")
+            nums = re.findall(r'\d+', cleaned)
             if nums:
                 data["Review Count"] = int(''.join(nums))
     except Exception:
         pass
+    # Fallback: parse from role=img aria-label
+    if not data["Review Count"]:
+        try:
+            role_img = page.locator("span[role='img'][aria-label*='reviews']").first
+            if role_img.is_visible(timeout=2000):
+                label = role_img.get_attribute("aria-label") or ""
+                m = re.search(r'([\d,]+)\s*reviews?', label, re.IGNORECASE)
+                if m:
+                    data["Review Count"] = int(m.group(1).replace(",", ""))
+        except Exception:
+            pass
 
-    # Extract Category
-    try:
-        category_button = page.locator("button.DkEaL").first
-        if category_button.is_visible():
-            data["Category"] = category_button.inner_text()
-    except Exception:
-        pass
+    # ── Category ──────────────────────────────────────────
+    data["Category"] = _safe_text(page, [
+        "button.DkEaL",
+        "button[jsaction*='category']",
+        "[data-attrid='subtitle'] span",
+    ])
 
-    # Extract Address
-    try:
-        address_element = page.locator("button[data-item-id='address'] div.Io6YTe").first
-        if address_element.is_visible():
-            data["Address"] = address_element.inner_text()
-    except Exception:
-        pass
+    # ── Address ───────────────────────────────────────────
+    data["Address"] = _safe_text(page, [
+        "button[data-item-id='address'] div.Io6YTe",
+        "button[data-item-id='address'] .rogA2c",
+        "button[data-item-id='address']",
+    ])
+    # Fallback: extract from aria-label
+    if not data["Address"]:
+        try:
+            addr_btn = page.locator("button[aria-label^='Address:']").first
+            if addr_btn.is_visible(timeout=2000):
+                label = addr_btn.get_attribute("aria-label") or ""
+                data["Address"] = label.replace("Address:", "").strip()
+        except Exception:
+            pass
 
-    # Extract Phone
-    try:
-        phone_element = page.locator("button[data-item-id^='phone:tel:'] div.Io6YTe").first
-        if phone_element.is_visible():
-            data["Phone Number"] = phone_element.inner_text()
-    except Exception:
-        pass
+    # ── Phone Number ──────────────────────────────────────
+    data["Phone Number"] = _safe_text(page, [
+        "button[data-item-id^='phone:tel:'] div.Io6YTe",
+        "button[data-item-id^='phone:tel:'] .rogA2c",
+        "button[data-item-id^='phone:tel:']",
+        "button[data-item-id^='phone'] div.Io6YTe",
+    ])
+    # Fallback: extract from aria-label
+    if not data["Phone Number"]:
+        try:
+            phone_btn = page.locator("button[aria-label^='Phone:']").first
+            if phone_btn.is_visible(timeout=2000):
+                label = phone_btn.get_attribute("aria-label") or ""
+                data["Phone Number"] = label.replace("Phone:", "").strip()
+        except Exception:
+            pass
 
-    # Extract Website
-    try:
-        website_element = page.locator("a[data-item-id='authority']").first
-        if website_element.is_visible():
-            data["Website"] = website_element.get_attribute("href")
-    except Exception:
-        pass
+    # ── Website ───────────────────────────────────────────
+    data["Website"] = _safe_attr(page, [
+        "a[data-item-id='authority']",
+        "a[aria-label^='Website:']",
+    ], "href")
 
+    # ── Email (opt-in) ────────────────────────────────────
     if extract_email and data["Website"]:
         data["Email"] = extract_email_from_website(page, data["Website"])
+
+    # Log which fields were successfully extracted
+    filled = [k for k, v in data.items() if v is not None and k != "Google Maps URL"]
+    logger.info(f"Extracted fields: {filled}")
 
     return data
 
 def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_email: bool = False) -> List[Dict]:
     """Scrolls down search results and extracts each listed place."""
     logger.info(f"Scraping search results for: {url}")
-    page.goto(url, wait_until="networkidle", timeout=30000)
+    page.goto(url, wait_until="networkidle", timeout=45000)
     random_delay(2, 4)
 
-    # Click accept cookies if prompted (useful for European IP addresses)
-    try:
-        cookie_button = page.locator("button:has-text('Accept all')").first
-        if cookie_button.is_visible(timeout=3000):
-            cookie_button.click()
-            random_delay(1, 2)
-    except Exception:
-        pass
+    # Dismiss consent dialogs (common on server IPs)
+    _dismiss_consent(page)
 
     # Try to find the scrollable container. It typically has role="feed"
     feed_scrollable = page.locator("div[role='feed']").first
