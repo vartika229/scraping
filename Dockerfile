@@ -17,10 +17,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
-# Copy Python application
+# Copy application files
 COPY google_maps_scraper.py .
+COPY app.py .
+COPY templates/ templates/
 
 # Create output directory for mounted volumes
 RUN mkdir -p /app/output
 
-ENTRYPOINT ["python", "google_maps_scraper.py"]
+EXPOSE 5000
+
+CMD ["python", "app.py"]

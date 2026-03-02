@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 import random
 import re
@@ -7,6 +8,7 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 import pandas as pd
+from openpyxl.styles import Font
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
 # Setup logging
@@ -229,7 +231,7 @@ def save_data(data: List[Dict], output_file: str, file_format: str):
         elif file_format == "json":
             df.to_json(output_file, orient="records", indent=4)
         elif file_format == "xlsx":
-            df.to_excel(output_file, index=False)
+            _write_excel_with_bold_headers(df, output_file)
         else:
             logger.error(f"Unsupported format: {file_format}")
             return
@@ -238,25 +240,201 @@ def save_data(data: List[Dict], output_file: str, file_format: str):
     except Exception as e:
         logger.error(f"Failed to save data: {e}")
 
+def _write_excel_with_bold_headers(df: pd.DataFrame, output):
+    """Write a DataFrame to Excel with bold header row.
+    
+    Args:
+        df: The DataFrame to write.
+        output: A file path string or a file-like object (e.g. io.BytesIO).
+    """
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Results")
+        ws = writer.sheets["Results"]
+        bold_font = Font(bold=True)
+        for cell in ws[1]:
+            cell.font = bold_font
+
+
+def generate_file_bytes(data: List[Dict], file_format: str) -> bytes:
+    """Generate file content as bytes for download (used by web app)."""
+    df = pd.DataFrame(data)
+    if file_format == "csv":
+        return df.to_csv(index=False).encode("utf-8")
+    elif file_format == "json":
+        return df.to_json(orient="records", indent=4).encode("utf-8")
+    elif file_format == "xlsx":
+        buf = io.BytesIO()
+        _write_excel_with_bold_headers(df, buf)
+        buf.seek(0)
+        return buf.read()
+    return b""
+
+
+def run_scrape(url: str, max_results: int = 20, extract_email: bool = False) -> List[Dict]:
+    """Run the full scraping pipeline and return results as a list of dicts.
+    
+    This is the entry point used by the web app.
+    """
+    logger.info("Starting up browser...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US"
+        )
+        page = context.new_page()
+        page.route("**/*", lambda route: route.continue_() if route.request.resource_type not in ["image", "media", "font"] else route.abort())
+
+        try:
+            if is_place_url(url):
+                logger.info("Detected Single Place URL")
+                data = extract_place_details(page, url, extract_email=extract_email)
+                results = [data]
+            else:
+                logger.info("Detected Search Results URL")
+                results = scrape_search_results(page, url, max_results=max_results, extract_email=extract_email)
+        finally:
+            context.close()
+            browser.close()
+    return results
+
+
+def validate_google_maps_url(url: str) -> bool:
+    """Validate that the provided URL is a Google Maps URL."""
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    valid_hosts = ["www.google.com", "google.com", "maps.google.com", "www.google.co.in", "google.co.in"]
+    if parsed.hostname not in valid_hosts:
+        return False
+    if "/maps" not in parsed.path and "/maps/" not in url:
+        return False
+    return True
+
+
+def interactive_input() -> dict:
+    """Prompt the user interactively for scraping configuration."""
+    print("\n" + "=" * 60)
+    print("       Google Maps Scraper -- Interactive Mode")
+    print("=" * 60)
+
+    # --- URL input ---
+    while True:
+        url = input("\n[URL] Paste a Google Maps URL (search results or business listing):\n> ").strip()
+        if not url:
+            print("   [!] URL cannot be empty. Please try again.")
+            continue
+        if not validate_google_maps_url(url):
+            print("   [!] That doesn't look like a valid Google Maps URL.")
+            print("      Example search URL  : https://www.google.com/maps/search/restaurants+in+delhi")
+            print("      Example listing URL  : https://www.google.com/maps/place/Some+Business/...")
+            continue
+        break
+
+    # --- Output format ---
+    print("\n[FORMAT] Select output format:")
+    print("   1) CSV   (default)")
+    print("   2) JSON")
+    print("   3) Excel (.xlsx)")
+    fmt_choice = input("> ").strip()
+    fmt_map = {"1": "csv", "2": "json", "3": "xlsx", "": "csv"}
+    file_format = fmt_map.get(fmt_choice, "csv")
+
+    # --- Output file name ---
+    default_name = f"scraped_data.{file_format}"
+    output = input(f"\n[OUTPUT] Output file name (default: {default_name}):\n> ").strip()
+    if not output:
+        output = default_name
+    if not output.endswith(f".{file_format}"):
+        file_name = output.split('.')[0] if '.' in output else output
+        output = f"{file_name}.{file_format}"
+
+    # --- Max results (only for search URLs) ---
+    max_results = 20
+    if not is_place_url(url):
+        max_input = input("\n[MAX] Max results to scrape (default: 20):\n> ").strip()
+        if max_input.isdigit() and int(max_input) > 0:
+            max_results = int(max_input)
+
+    # --- Email extraction ---
+    email_input = input("\n[EMAIL] Extract emails from business websites? (y/N):\n> ").strip().lower()
+    extract_emails = email_input in ("y", "yes")
+
+    # --- Visible browser ---
+    visible_input = input("\n[BROWSER] Show browser window while scraping? (y/N):\n> ").strip().lower()
+    visible = visible_input in ("y", "yes")
+
+    print("\n" + "-" * 60)
+    print(f"   URL      : {url}")
+    print(f"   Format   : {file_format}")
+    print(f"   Output   : {output}")
+    if not is_place_url(url):
+        print(f"   Max      : {max_results}")
+    print(f"   Emails   : {'Yes' if extract_emails else 'No'}")
+    print(f"   Visible  : {'Yes' if visible else 'No'}")
+    print("-" * 60)
+
+    confirm = input("\nStart scraping? (Y/n): ").strip().lower()
+    if confirm in ("n", "no"):
+        print("Cancelled.")
+        exit(0)
+
+    return {
+        "url": url,
+        "output": output,
+        "format": file_format,
+        "max": max_results,
+        "emails": extract_emails,
+        "visible": visible,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Google Maps Scraper")
-    parser.add_argument("--url", required=True, help="Google Maps Search or Place URL")
-    parser.add_argument("--output", required=True, help="Output file name")
+    parser.add_argument("--url", required=False, default=None, help="Google Maps Search or Place URL")
+    parser.add_argument("--output", required=False, default=None, help="Output file name")
     parser.add_argument("--format", choices=["csv", "json", "xlsx"], default="csv", help="Output format (default: csv)")
     parser.add_argument("--max", type=int, default=20, help="Max results for search mode (default: 20)")
     parser.add_argument("--emails", action="store_true", help="Opt-in email extraction (scans business websites)")
     parser.add_argument("--visible", action="store_true", help="Show browser window for debugging")
     args = parser.parse_args()
 
-    # Automatically ensure output has correct extension
-    if not args.output.endswith(f".{args.format}"):
-        file_name = args.output.split('.')[0] if '.' in args.output else args.output
-        args.output = f"{file_name}.{args.format}"
+    # If no URL provided, enter interactive mode
+    if args.url is None:
+        config = interactive_input()
+        url = config["url"]
+        output = config["output"]
+        file_format = config["format"]
+        max_results = config["max"]
+        extract_emails = config["emails"]
+        visible = config["visible"]
+    else:
+        url = args.url
+        file_format = args.format
+        max_results = args.max
+        extract_emails = args.emails
+        visible = args.visible
+
+        # Determine output file name
+        if args.output:
+            output = args.output
+        else:
+            output = f"scraped_data.{file_format}"
+
+        # Automatically ensure output has correct extension
+        if not output.endswith(f".{file_format}"):
+            file_name = output.split('.')[0] if '.' in output else output
+            output = f"{file_name}.{file_format}"
 
     logger.info("Starting up browser...")
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=not args.visible,
+            headless=not visible,
             args=["--disable-blink-features=AutomationControlled"]
         )
         context = browser.new_context(
@@ -270,15 +448,15 @@ def main():
         page.route("**/*", lambda route: route.continue_() if route.request.resource_type not in ["image", "media", "font"] else route.abort())
 
         try:
-            if is_place_url(args.url):
+            if is_place_url(url):
                 logger.info("Detected Single Place URL")
-                data = extract_place_details(page, args.url, extract_email=args.emails)
+                data = extract_place_details(page, url, extract_email=extract_emails)
                 results = [data]
             else:
                 logger.info("Detected Search Results URL")
-                results = scrape_search_results(page, args.url, max_results=args.max, extract_email=args.emails)
+                results = scrape_search_results(page, url, max_results=max_results, extract_email=extract_emails)
                 
-            save_data(results, args.output, args.format)
+            save_data(results, output, file_format)
         finally:
             context.close()
             browser.close()

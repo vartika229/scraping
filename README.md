@@ -27,9 +27,25 @@ To run the scraper without installing Playwright and Chromium on your host machi
 
 ## Usage
 
-### Local Usage
+### Interactive Mode (Recommended)
 
-Run the script locally passing arguments.
+Simply run the script without any arguments. You will be guided through the setup:
+
+```bash
+python google_maps_scraper.py
+```
+
+The interactive mode will prompt you to:
+1. Paste a Google Maps URL (search results or business listing)
+2. Choose an output format (CSV, JSON, or Excel)
+3. Set the output file name
+4. Configure max results (for search URLs)
+5. Opt-in to email extraction
+6. Show/hide the browser window
+
+### CLI Mode
+
+You can also pass arguments directly for scripted / automated usage:
 
 ```bash
 # Basic Search Mode (Exports to CSV by default)
@@ -56,8 +72,8 @@ docker run --rm -v "$(pwd)/output:/app/output" gmaps-scraper --url "https://www.
 
 | Argument | Description | Required | Default |
 |---|---|---|---|
-| `--url` | The Google Maps search or place URL | Yes | None |
-| `--output` | The filename to save the extracted data | Yes | None |
+| `--url` | The Google Maps search or place URL | No (interactive mode if omitted) | None |
+| `--output` | The filename to save the extracted data | No | `scraped_data.<format>` |
 | `--format` | Data format: `csv`, `json`, or `xlsx` | No | `csv` |
 | `--max` | Limit the number of business results returned (search mode) | No | 20 |
 | `--emails` | Flag to enable scraping the business website for emails | No | False |
