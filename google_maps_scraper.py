@@ -52,8 +52,24 @@ def extract_email_from_website(page: Page, website_url: str) -> Optional[str]:
             pass
     return None
 
+def is_robot_check(page: Page) -> bool:
+    """Detect if Google is blocking us with a CAPTCHA/Robot check."""
+    try:
+        content = page.content().lower()
+        indicators = ["unusual traffic", "captcha", "verify you're a human", "robot.html", "sorry/index"]
+        for ind in indicators:
+            if ind in content:
+                logger.error(f"Robot check detected! Indicator: {ind}")
+                return True
+        return False
+    except Exception:
+        return False
+
 def _dismiss_consent(page: Page):
     """Dismiss Google consent / cookie dialogs that block the page on servers."""
+    if is_robot_check(page):
+        return
+
     consent_selectors = [
         "button:has-text('Accept all')",
         "button:has-text('Reject all')",
@@ -64,9 +80,9 @@ def _dismiss_consent(page: Page):
     for sel in consent_selectors:
         try:
             btn = page.locator(sel).first
-            if btn.is_visible(timeout=2000):
+            if btn.is_visible(timeout=1500):
                 btn.click()
-                random_delay(1, 2)
+                random_delay(0.5, 1.5)
                 return
         except Exception:
             continue
@@ -110,13 +126,16 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 
     # Handle consent dialogs (common on server IPs, especially in Europe)
     _dismiss_consent(page)
-    random_delay(2, 4)
+    random_delay(0.5, 1.5)
 
     # Wait for the place panel to be present before extracting
     try:
-        page.locator("h1").first.wait_for(state="visible", timeout=8000)
-    except Exception as e:
-        logger.warning(f"Place title did not appear in time: {e}")
+        # Try to find a header or the main container
+        page.locator("h1.DUwDvf, [role='main'] h1, [data-attrid='title']").first.wait_for(state="visible", timeout=5000)
+    except Exception:
+        if is_robot_check(page):
+            return data
+        logger.warning(f"Place title did not appear quickly for {url}. Attempting extraction anyway.")
 
     data = {
         "Company Name": None,
@@ -250,11 +269,15 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     # Dismiss consent dialogs (common on server IPs)
     _dismiss_consent(page)
 
-    # Wait for at least one result link to appear in the DOM (up to 10s)
+    # Wait for at least one result link to appear in the DOM (up to 12s)
     try:
-        page.wait_for_selector("a[href*='/maps/place/'], a.hfpxzc", timeout=10000)
+        # Use a combination of common listing indicators
+        page.wait_for_selector("a[href*='/maps/place/'], a.hfpxzc, [role='article']", timeout=12000)
     except Exception:
-        logger.warning("No place links appeared after 10 seconds.")
+        if is_robot_check(page):
+            logger.error("Scraping blocked by Google Robot check.")
+            return []
+        logger.warning("No place links appeared after 12 seconds.")
         
     places = []
     processed_urls = set()
@@ -298,19 +321,21 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         # Scroll down
         if feed_scrollable.is_visible():
             try:
-                page.evaluate("element => element.scrollBy(0, 800)", feed_scrollable.element_handle())
-                random_delay(1.5, 3.0)
+                # Scroll smaller increments to trigger dynamic loading more reliably
+                page.evaluate("element => element.scrollBy(0, 1000)", feed_scrollable.element_handle())
+                random_delay(1.0, 2.0)
                 
                 # Check for "You've reached the end of the list" element
                 end_of_list = page.locator("text='You\\'ve reached the end of the list'").first
-                if end_of_list.is_visible(timeout=1000):
+                if end_of_list.is_visible(timeout=500):
                     logger.info("Reached end of list.")
                     break
             except Exception as e:
-                logger.warning(f"Error scrolling: {e}")
-                break
+                logger.debug(f"Scrolling hint failed: {e}")
+                # Sometimes it fails even if results are there, just keep going
         else:
-            logger.warning("Feed scrollable not found in DOM. Returning the visible results.")
+            # If no feed is found, we might be in lite mode and already have the first page items
+            logger.info("No more scrollable feed found. Returning visible items.")
             break
 
     logger.info(f"Collected {len(places)} listing URLs. Extracting specific details...")
