@@ -5,7 +5,7 @@ import random
 import re
 import time
 from typing import Dict, List, Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import pandas as pd
 from openpyxl.styles import Font
@@ -24,6 +24,29 @@ def is_place_url(url: str) -> bool:
 
 def random_delay(min_sec: float = 1.0, max_sec: float = 3.0):
     time.sleep(random.uniform(min_sec, max_sec))
+
+
+def normalize_place_url(raw_url: str) -> Optional[str]:
+    """Normalize place URLs so duplicates and tracking params don't break processing."""
+    if not raw_url:
+        return None
+
+    full_url = urljoin("https://www.google.com", raw_url.strip())
+    parsed = urlparse(full_url)
+
+    if "/maps/place/" not in parsed.path:
+        return None
+
+    # Keep only the stable part of a place URL.
+    base_url = f"https://www.google.com{parsed.path}"
+
+    # Some cards expose only a CID in query params, keep it if present.
+    query = parse_qs(parsed.query)
+    cid = query.get("cid", [None])[0]
+    if cid:
+        return f"{base_url}?cid={cid}"
+
+    return base_url
 
 def extract_email_from_website(page: Page, website_url: str) -> Optional[str]:
     if not website_url or pd.isna(website_url):
@@ -132,9 +155,13 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     }
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout while loading {url}, attempting to extract what is available.")
+        logger.warning(f"Timeout while loading {url}, retrying with lighter wait condition.")
+        try:
+            page.goto(url, wait_until="commit", timeout=10000)
+        except PlaywrightTimeoutError:
+            logger.warning(f"Second timeout while loading {url}, attempting to extract what is available.")
 
     # Handle consent dialogs
     _dismiss_consent(page)
@@ -299,13 +326,10 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         for link in links:
             try:
                 href = link.get_attribute("href")
-                if href:
-                    href = urljoin("https://www.google.com", href)
-                if href and href not in processed_urls:
-                    if "/maps/place/" not in href:
-                        continue
-                    processed_urls.add(href)
-                    places.append(href)
+                normalized_url = normalize_place_url(href)
+                if normalized_url and normalized_url not in processed_urls:
+                    processed_urls.add(normalized_url)
+                    places.append(normalized_url)
                     if len(places) >= max_results:
                         break
             except Exception:
@@ -349,11 +373,17 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     results = []
     for i, place_url in enumerate(places, 1):
         logger.info(f"Processing listing {i}/{len(places)}")
+        detail_page = page.context.new_page()
         try:
-            details = extract_place_details(page, place_url, extract_email)
+            details = extract_place_details(detail_page, place_url, extract_email)
             results.append(details)
         except Exception as e:
             logger.error(f"Error extracting {place_url}: {e}")
+        finally:
+            try:
+                detail_page.close()
+            except Exception:
+                pass
             
     return results
 
