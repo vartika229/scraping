@@ -124,18 +124,16 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout while loading {url}, attempting to extract what is available.")
 
-    # Handle consent dialogs (common on server IPs, especially in Europe)
+    # Handle consent dialogs
     _dismiss_consent(page)
-    random_delay(0.5, 1.5)
+    random_delay(0.5, 1.0)
 
-    # Wait for the place panel to be present before extracting
+    # Wait for some detail indicator to be present
     try:
-        # Try to find a header or the main container
-        page.locator("h1.DUwDvf, [role='main'] h1, [data-attrid='title']").first.wait_for(state="visible", timeout=5000)
+        page.locator("h1.DUwDvf, [role='main'] h1, [data-attrid='title'], div.R6S9Pc").first.wait_for(state="attached", timeout=6000)
     except Exception:
         if is_robot_check(page):
             return data
-        logger.warning(f"Place title did not appear quickly for {url}. Attempting extraction anyway.")
 
     data = {
         "Company Name": None,
@@ -205,20 +203,24 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     data["Category"] = _safe_text(page, [
         "button.DkEaL",
         "button[jsaction*='category']",
+        "span.fontBodyMedium > span > button",
         "[data-attrid='subtitle'] span",
+        "div.fontBodyMedium",
     ])
 
     # ── Address ───────────────────────────────────────────
     data["Address"] = _safe_text(page, [
         "button[data-item-id='address'] div.Io6YTe",
         "button[data-item-id='address'] .rogA2c",
+        "button[aria-label^='Address:'] div.Io6YTe",
+        "div.R6S9Pc div.Io6YTe",
         "button[data-item-id='address']",
     ])
     # Fallback: extract from aria-label
     if not data["Address"]:
         try:
-            addr_btn = page.locator("button[aria-label^='Address:']").first
-            if addr_btn.is_visible(timeout=2000):
+            addr_btn = page.locator("button[aria-label^='Address:'], [data-item-id='address']").first
+            if addr_btn.is_visible(timeout=1000):
                 label = addr_btn.get_attribute("aria-label") or ""
                 data["Address"] = label.replace("Address:", "").strip()
         except Exception:
@@ -228,14 +230,15 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     data["Phone Number"] = _safe_text(page, [
         "button[data-item-id^='phone:tel:'] div.Io6YTe",
         "button[data-item-id^='phone:tel:'] .rogA2c",
-        "button[data-item-id^='phone:tel:']",
+        "button[aria-label^='Phone:'] div.Io6YTe",
         "button[data-item-id^='phone'] div.Io6YTe",
+        "button[data-item-id^='phone']",
     ])
     # Fallback: extract from aria-label
     if not data["Phone Number"]:
         try:
             phone_btn = page.locator("button[aria-label^='Phone:']").first
-            if phone_btn.is_visible(timeout=2000):
+            if phone_btn.is_visible(timeout=1000):
                 label = phone_btn.get_attribute("aria-label") or ""
                 data["Phone Number"] = label.replace("Phone:", "").strip()
         except Exception:
@@ -245,6 +248,8 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     data["Website"] = _safe_attr(page, [
         "a[data-item-id='authority']",
         "a[aria-label^='Website:']",
+        "a[data-value='Website']",
+        "div.IT56Ae a",
     ], "href")
 
     # ── Email (opt-in) ────────────────────────────────────
@@ -261,23 +266,25 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     """Scrolls down search results and extracts each listed place."""
     logger.info(f"Scraping search results for: {url}")
     try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
+        # Use domcontentloaded for speed, we wait for selectors manually
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout loading list view for {url}. Attempting to proceed with whatever loaded.")
-    random_delay(2, 4)
+        logger.warning(f"Timeout loading list view for {url}. Proceding.")
+    
+    # Minimal delay for JS to start rendering
+    random_delay(1.5, 2.5)
 
     # Dismiss consent dialogs (common on server IPs)
     _dismiss_consent(page)
 
-    # Wait for at least one result link to appear in the DOM (up to 12s)
+    # Wait for at least one result link or a listing container (up to 15s)
     try:
-        # Use a combination of common listing indicators
-        page.wait_for_selector("a[href*='/maps/place/'], a.hfpxzc, [role='article']", timeout=12000)
+        page.locator("a[href*='/maps/place/'], a.hfpxzc, [role='article'], div.search-result").first.wait_for(state="visible", timeout=15000)
     except Exception:
         if is_robot_check(page):
             logger.error("Scraping blocked by Google Robot check.")
             return []
-        logger.warning("No place links appeared after 12 seconds.")
+        logger.warning("Search results did not appear in time.")
         
     places = []
     processed_urls = set()
@@ -287,8 +294,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
 
     while len(places) < max_results:
         # Get all links matching a place URL (works in both rich and lite modes)        
-        # We do this FIRST, before checking for scrolling, to grab whatever is visible
-        links = page.locator("a[href*='/maps/place/'], a.hfpxzc").all()
+        links = page.locator("a[href*='/maps/place/'], a.hfpxzc, a[data-clear-ad-type-id]").all()
         
         for link in links:
             try:
@@ -306,8 +312,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             
         if len(places) == last_places_count:
             consecutive_no_new += 1
-            if consecutive_no_new >= 3:
-                logger.info("No new places found after 3 scroll attempts. Breaking.")
+            if consecutive_no_new >= 2: # Reduce retries for speed
                 break
         else:
             consecutive_no_new = 0
@@ -315,28 +320,25 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
 
         # Try to find the scrollable container dynamically
         feed_scrollable = page.locator("div[role='feed']").first
-        if not feed_scrollable.is_visible():
-            feed_scrollable = page.locator("div.m6QErb[aria-label*='Results']").first
-
-        # Scroll down
         if feed_scrollable.is_visible():
             try:
-                # Scroll smaller increments to trigger dynamic loading more reliably
-                page.evaluate("element => element.scrollBy(0, 1000)", feed_scrollable.element_handle())
-                random_delay(1.0, 2.0)
-                
-                # Check for "You've reached the end of the list" element
-                end_of_list = page.locator("text='You\\'ve reached the end of the list'").first
-                if end_of_list.is_visible(timeout=500):
-                    logger.info("Reached end of list.")
-                    break
-            except Exception as e:
-                logger.debug(f"Scrolling hint failed: {e}")
-                # Sometimes it fails even if results are there, just keep going
+                page.evaluate("element => element.scrollBy(0, 1500)", feed_scrollable.element_handle())
+            except Exception:
+                page.evaluate("window.scrollBy(0, 1500)")
         else:
-            # If no feed is found, we might be in lite mode and already have the first page items
-            logger.info("No more scrollable feed found. Returning visible items.")
-            break
+            # Fallback: scroll the whole window
+            page.evaluate("window.scrollBy(0, 1500)")
+            
+        random_delay(1.0, 2.0)
+        
+        # Check for pagination "Next" button in some versions
+        next_btn = page.locator("button[aria-label*='Next page'], a[aria-label*='Next page']").first
+        if next_btn.is_visible(timeout=500):
+            try:
+                next_btn.click()
+                random_delay(2, 3)
+            except Exception:
+                pass
 
     logger.info(f"Collected {len(places)} listing URLs. Extracting specific details...")
     
