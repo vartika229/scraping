@@ -252,7 +252,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
 
     # Try to find the scrollable container. It typically has role="feed"
     feed_scrollable = page.locator("div[role='feed']").first
-    if not feed_scrollable.is_visible(timeout=15000):
+    if not feed_scrollable.is_visible(timeout=10000):
         # Fallback locator if google changes the role
         feed_scrollable = page.locator("div.m6QErb[aria-label*='Results']").first
 
@@ -263,16 +263,19 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     consecutive_no_new = 0
 
     while len(places) < max_results:
-        # All main listing wrappers are a tags with class hfpxzc
-        links = page.locator("a.hfpxzc").all()
+        # Get all links matching a place URL (works in both rich and lite modes)
+        links = page.locator("a[href*='/maps/place/']").all()
         
         for link in links:
-            href = link.get_attribute("href")
-            if href and href not in processed_urls:
-                processed_urls.add(href)
-                places.append(href)
-                if len(places) >= max_results:
-                    break
+            try:
+                href = link.get_attribute("href")
+                if href and href not in processed_urls:
+                    processed_urls.add(href)
+                    places.append(href)
+                    if len(places) >= max_results:
+                        break
+            except Exception:
+                continue
         
         if len(places) >= max_results:
             break
@@ -301,7 +304,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
                 logger.warning(f"Error scrolling: {e}")
                 break
         else:
-            logger.warning("Feed scrollable not found in DOM.")
+            logger.warning("Feed scrollable not found in DOM. Returning the visible results.")
             break
 
     logger.info(f"Collected {len(places)} listing URLs. Extracting specific details...")
