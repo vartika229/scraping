@@ -250,12 +250,12 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     # Dismiss consent dialogs (common on server IPs)
     _dismiss_consent(page)
 
-    # Try to find the scrollable container. It typically has role="feed"
-    feed_scrollable = page.locator("div[role='feed']").first
-    if not feed_scrollable.is_visible(timeout=10000):
-        # Fallback locator if google changes the role
-        feed_scrollable = page.locator("div.m6QErb[aria-label*='Results']").first
-
+    # Wait for at least one result link to appear in the DOM (up to 10s)
+    try:
+        page.wait_for_selector("a[href*='/maps/place/'], a.hfpxzc", timeout=10000)
+    except Exception:
+        logger.warning("No place links appeared after 10 seconds.")
+        
     places = []
     processed_urls = set()
 
@@ -263,8 +263,9 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     consecutive_no_new = 0
 
     while len(places) < max_results:
-        # Get all links matching a place URL (works in both rich and lite modes)
-        links = page.locator("a[href*='/maps/place/']").all()
+        # Get all links matching a place URL (works in both rich and lite modes)        
+        # We do this FIRST, before checking for scrolling, to grab whatever is visible
+        links = page.locator("a[href*='/maps/place/'], a.hfpxzc").all()
         
         for link in links:
             try:
@@ -288,6 +289,11 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         else:
             consecutive_no_new = 0
             last_places_count = len(places)
+
+        # Try to find the scrollable container dynamically
+        feed_scrollable = page.locator("div[role='feed']").first
+        if not feed_scrollable.is_visible():
+            feed_scrollable = page.locator("div.m6QErb[aria-label*='Results']").first
 
         # Scroll down
         if feed_scrollable.is_visible():
