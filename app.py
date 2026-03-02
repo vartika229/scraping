@@ -31,11 +31,13 @@ def _run_job(job_id: str, url: str, max_results: int, extract_email: bool):
     try:
         results = run_scrape(url, max_results=max_results, extract_email=extract_email)
         jobs[job_id]["results"] = results
+        # Even if there were some internal timeouts, if we got results back, call it done.
         jobs[job_id]["status"] = "done"
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}")
+        logger.error(f"Job {job_id} failed catastrophically: {e}")
+        # If run_scrape failed completely before getting any results
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["error"] = "Scraping failed: " + str(e)
 
 
 @app.route("/scrape", methods=["POST"])

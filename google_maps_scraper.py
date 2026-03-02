@@ -104,7 +104,7 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     """Extracts details from a single place listing."""
     logger.info(f"Extracting details for: {url}")
     try:
-        page.goto(url, wait_until="networkidle", timeout=45000)
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout while loading {url}, attempting to extract what is available.")
 
@@ -114,9 +114,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 
     # Wait for the place panel to be present before extracting
     try:
-        page.locator("h1").first.wait_for(state="visible", timeout=10000)
-    except Exception:
-        logger.warning("Place title did not appear in time, extracting what is available.")
+        page.locator("h1").first.wait_for(state="visible", timeout=8000)
+    except Exception as e:
+        logger.warning(f"Place title did not appear in time: {e}")
 
     data = {
         "Company Name": None,
@@ -241,7 +241,10 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_email: bool = False) -> List[Dict]:
     """Scrolls down search results and extracts each listed place."""
     logger.info(f"Scraping search results for: {url}")
-    page.goto(url, wait_until="networkidle", timeout=45000)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+    except PlaywrightTimeoutError:
+        logger.warning(f"Timeout loading list view for {url}. Attempting to proceed with whatever loaded.")
     random_delay(2, 4)
 
     # Dismiss consent dialogs (common on server IPs)
@@ -249,7 +252,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
 
     # Try to find the scrollable container. It typically has role="feed"
     feed_scrollable = page.locator("div[role='feed']").first
-    if not feed_scrollable.is_visible(timeout=5000):
+    if not feed_scrollable.is_visible(timeout=15000):
         # Fallback locator if google changes the role
         feed_scrollable = page.locator("div.m6QErb[aria-label*='Results']").first
 
@@ -390,7 +393,9 @@ def run_scrape(url: str, max_results: int = 20, extract_email: bool = False) -> 
             locale="en-US"
         )
         page = context.new_page()
-        page.route("**/*", lambda route: route.continue_() if route.request.resource_type not in ["image", "media", "font"] else route.abort())
+        # Block unnecessary resources to save bandwidth (do NOT block stylesheets or scripts, it breaks the DOM structure)
+        excluded_resource_types = ["image", "media", "font"]
+        page.route("**/*", lambda route: route.continue_() if route.request.resource_type not in excluded_resource_types else route.abort())
 
         try:
             if is_place_url(url):
