@@ -319,6 +319,15 @@
             }, 2000);
         }
 
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
         function renderTable(results) {
             const section = document.getElementById('results-section');
             const thead = document.getElementById('table-head');
@@ -328,14 +337,19 @@
             const cols = Object.keys(results[0]);
             count.textContent = results.length + ' record' + (results.length === 1 ? '' : 's');
 
-            thead.innerHTML = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+            thead.innerHTML = '<tr>' + cols.map(c => `<th>${escapeHtml(c)}</th>`).join('') + '</tr>';
             tbody.innerHTML = results.map(row =>
                 '<tr>' + cols.map(c => {
-                    let val = row[c] ?? '—';
-                    if (typeof val === 'string' && val.startsWith('http')) {
-                        val = `<a href="${val}" target="_blank" rel="noopener">${val.length > 50 ? val.substring(0, 50) + '...' : val}</a>`;
+                    const rawVal = row[c] ?? '—';
+                    const safeTitle = escapeHtml((row[c] ?? '').toString());
+
+                    if (typeof rawVal === 'string' && /^https?:\/\//i.test(rawVal)) {
+                        const safeUrl = encodeURI(rawVal);
+                        const label = rawVal.length > 50 ? rawVal.substring(0, 50) + '...' : rawVal;
+                        return `<td title="${safeTitle}"><a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a></td>`;
                     }
-                    return `<td title="${(row[c] ?? '').toString().replace(/"/g, '&quot;')}">${val}</td>`;
+
+                    return `<td title="${safeTitle}">${escapeHtml(rawVal)}</td>`;
                 }).join('') + '</tr>'
             ).join('');
 

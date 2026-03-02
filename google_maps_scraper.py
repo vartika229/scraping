@@ -5,7 +5,7 @@ import random
 import re
 import time
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import pandas as pd
 from openpyxl.styles import Font
@@ -119,6 +119,18 @@ def _safe_attr(page: Page, selectors: list, attr: str, timeout: int = 3000) -> O
 def extract_place_details(page: Page, url: str, extract_email: bool = False) -> Dict:
     """Extracts details from a single place listing."""
     logger.info(f"Extracting details for: {url}")
+    data = {
+        "Company Name": None,
+        "Phone Number": None,
+        "Email": None,
+        "Website": None,
+        "Rating": None,
+        "Review Count": None,
+        "Category": None,
+        "Address": None,
+        "Google Maps URL": url
+    }
+
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=25000)
     except PlaywrightTimeoutError:
@@ -134,18 +146,6 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     except Exception:
         if is_robot_check(page):
             return data
-
-    data = {
-        "Company Name": None,
-        "Phone Number": None,
-        "Email": None,
-        "Website": None,
-        "Rating": None,
-        "Review Count": None,
-        "Category": None,
-        "Address": None,
-        "Google Maps URL": url
-    }
 
     # ── Company Name ──────────────────────────────────────
     data["Company Name"] = _safe_text(page, [
@@ -299,7 +299,11 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         for link in links:
             try:
                 href = link.get_attribute("href")
+                if href:
+                    href = urljoin("https://www.google.com", href)
                 if href and href not in processed_urls:
+                    if "/maps/place/" not in href:
+                        continue
                     processed_urls.add(href)
                     places.append(href)
                     if len(places) >= max_results:
@@ -453,8 +457,8 @@ def validate_google_maps_url(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False
-    valid_hosts = ["www.google.com", "google.com", "maps.google.com", "www.google.co.in", "google.co.in"]
-    if parsed.hostname not in valid_hosts:
+    host = (parsed.hostname or "").lower()
+    if not re.match(r"(^|.*\.)google\.[a-z.]+$", host):
         return False
     if "/maps" not in parsed.path and "/maps/" not in url:
         return False
