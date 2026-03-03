@@ -583,11 +583,38 @@
         async function pollJob(jobId, btn, spinner) {
             const spinnerText = document.getElementById('spinner-text');
             let elapsed = 0;
+            let transientFailures = 0;
+            const maxTransientFailures = 6;
+
+            const stopPollingWithError = (message) => {
+                clearInterval(interval);
+                btn.disabled = false;
+                spinner.classList.remove('visible');
+                showBanner(message, 'error');
+            };
+
             const interval = setInterval(async () => {
                 elapsed += 2;
                 spinnerText.textContent = `Scraping in progress... (${elapsed}s)`;
                 try {
                     const res = await fetch(API_BASE + '/status/' + jobId);
+
+                    if (!res.ok) {
+                        // Render/hosting proxies can briefly return 502/503 while a dyno wakes.
+                        if (res.status === 502 || res.status === 503 || res.status === 504) {
+                            transientFailures += 1;
+                            if (transientFailures <= maxTransientFailures) {
+                                spinnerText.textContent = `Backend warming up... retrying (${transientFailures}/${maxTransientFailures})`;
+                                return;
+                            }
+                            stopPollingWithError('Backend is temporarily unavailable (gateway error). Please retry in a few seconds.');
+                            return;
+                        }
+                        stopPollingWithError(`Polling failed with HTTP ${res.status}.`);
+                        return;
+                    }
+
+                    transientFailures = 0;
                     const data = await res.json();
 
                     if (data.status === 'done') {
@@ -602,16 +629,15 @@
                             showBanner('Scraping completed but no results were found.', 'error');
                         }
                     } else if (data.status === 'error') {
-                        clearInterval(interval);
-                        btn.disabled = false;
-                        spinner.classList.remove('visible');
-                        showBanner('Error: ' + (data.error || 'Unknown error'), 'error');
+                        stopPollingWithError('Error: ' + (data.error || 'Unknown error'));
                     }
                 } catch (e) {
-                    clearInterval(interval);
-                    btn.disabled = false;
-                    spinner.classList.remove('visible');
-                    showBanner('Polling error: ' + e.message, 'error');
+                    transientFailures += 1;
+                    if (transientFailures <= maxTransientFailures) {
+                        spinnerText.textContent = `Temporary network issue... retrying (${transientFailures}/${maxTransientFailures})`;
+                        return;
+                    }
+                    stopPollingWithError('Polling error: ' + e.message);
                 }
             }, 2000);
         }
