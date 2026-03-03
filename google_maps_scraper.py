@@ -15,6 +15,14 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as Playwrigh
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Timeouts tuned for cloud/server reliability. Keeping them too high causes
+# linear blow-ups when scraping many listings.
+LIST_GOTO_TIMEOUT_MS = 20000
+DETAIL_GOTO_TIMEOUT_MS = 12000
+DETAIL_RETRY_TIMEOUT_MS = 6000
+WEBSITE_GOTO_TIMEOUT_MS = 10000
+DETAIL_READY_TIMEOUT_MS = 5000
+
 # Basic regex for email extraction
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
 
@@ -24,6 +32,12 @@ def is_place_url(url: str) -> bool:
 
 def random_delay(min_sec: float = 1.0, max_sec: float = 3.0):
     time.sleep(random.uniform(min_sec, max_sec))
+
+
+def exponential_backoff(attempt: int, base: float = 0.75, cap: float = 4.0) -> None:
+    """Small jittered backoff to reduce immediate re-tries that trigger anti-bot."""
+    sleep_time = min(cap, base * (2 ** max(0, attempt - 1))) + random.uniform(0.1, 0.4)
+    time.sleep(sleep_time)
 
 
 def normalize_place_url(raw_url: str) -> Optional[str]:
@@ -54,7 +68,7 @@ def extract_email_from_website(page: Page, website_url: str) -> Optional[str]:
     try:
         new_page = page.context.new_page()
         # Fast config: shorter timeout, wait until domcontentloaded to save time.
-        new_page.goto(website_url, timeout=15000, wait_until="domcontentloaded")
+        new_page.goto(website_url, timeout=WEBSITE_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
         content = new_page.content()
         emails = re.findall(EMAIL_REGEX, content)
         new_page.close()
@@ -154,14 +168,20 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
         "Google Maps URL": url
     }
 
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=20000)
-    except PlaywrightTimeoutError:
-        logger.warning(f"Timeout while loading {url}, retrying with lighter wait condition.")
+    for attempt in range(1, 3):
         try:
-            page.goto(url, wait_until="commit", timeout=10000)
+            page.goto(
+                url,
+                wait_until="domcontentloaded" if attempt == 1 else "commit",
+                timeout=DETAIL_GOTO_TIMEOUT_MS if attempt == 1 else DETAIL_RETRY_TIMEOUT_MS,
+            )
+            break
         except PlaywrightTimeoutError:
-            logger.warning(f"Second timeout while loading {url}, attempting to extract what is available.")
+            if attempt == 2:
+                logger.warning(f"Timeout while loading {url}. Extracting best-effort fields.")
+            else:
+                logger.warning(f"Timeout while loading {url}, retrying quickly.")
+                exponential_backoff(attempt)
 
     # Handle consent dialogs
     _dismiss_consent(page)
@@ -169,7 +189,7 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 
     # Wait for some detail indicator to be present
     try:
-        page.locator("h1.DUwDvf, [role='main'] h1, [data-attrid='title'], div.R6S9Pc").first.wait_for(state="attached", timeout=6000)
+        page.locator("h1.DUwDvf, [role='main'] h1, [data-attrid='title'], div.R6S9Pc").first.wait_for(state="attached", timeout=DETAIL_READY_TIMEOUT_MS)
     except Exception:
         if is_robot_check(page):
             return data
@@ -294,7 +314,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     logger.info(f"Scraping search results for: {url}")
     try:
         # Use domcontentloaded for speed, we wait for selectors manually
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(url, wait_until="domcontentloaded", timeout=LIST_GOTO_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout loading list view for {url}. Proceding.")
     
@@ -319,7 +339,11 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     last_places_count = 0
     consecutive_no_new = 0
 
-    while len(places) < max_results:
+    max_scroll_cycles = max(8, min(40, max_results * 2))
+    scroll_cycles = 0
+
+    while len(places) < max_results and scroll_cycles < max_scroll_cycles:
+        scroll_cycles += 1
         # Get all links matching a place URL (works in both rich and lite modes)        
         links = page.locator("a[href*='/maps/place/'], a.hfpxzc, a[data-clear-ad-type-id]").all()
         
@@ -340,7 +364,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             
         if len(places) == last_places_count:
             consecutive_no_new += 1
-            if consecutive_no_new >= 2: # Reduce retries for speed
+            if consecutive_no_new >= 4:
                 break
         else:
             consecutive_no_new = 0
@@ -371,19 +395,30 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
     logger.info(f"Collected {len(places)} listing URLs. Extracting specific details...")
     
     results = []
+    consecutive_detail_failures = 0
+    detail_page = page.context.new_page()
+
     for i, place_url in enumerate(places, 1):
         logger.info(f"Processing listing {i}/{len(places)}")
-        detail_page = page.context.new_page()
         try:
             details = extract_place_details(detail_page, place_url, extract_email)
+            if is_robot_check(detail_page):
+                logger.error("Robot check triggered while collecting details. Stopping early.")
+                break
             results.append(details)
+            consecutive_detail_failures = 0
         except Exception as e:
             logger.error(f"Error extracting {place_url}: {e}")
-        finally:
-            try:
-                detail_page.close()
-            except Exception:
-                pass
+            consecutive_detail_failures += 1
+            if consecutive_detail_failures >= 3:
+                logger.error("Multiple consecutive detail failures; stopping to avoid prolonged timeouts.")
+                break
+        random_delay(0.4, 1.1)
+
+    try:
+        detail_page.close()
+    except Exception:
+        pass
             
     return results
 
@@ -463,6 +498,7 @@ def run_scrape(url: str, max_results: int = 20, extract_email: bool = False) -> 
             locale="en-US"
         )
         page = context.new_page()
+        page.set_default_timeout(9000)
         # Block unnecessary resources to save bandwidth (do NOT block stylesheets or scripts, it breaks the DOM structure)
         excluded_resource_types = ["image", "media", "font"]
         page.route("**/*", lambda route: route.continue_() if route.request.resource_type not in excluded_resource_types else route.abort())
