@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 LIST_GOTO_TIMEOUT_MS = 20000
 DETAIL_GOTO_TIMEOUT_MS = 12000
 DETAIL_RETRY_TIMEOUT_MS = 6000
-WEBSITE_GOTO_TIMEOUT_MS = 10000
-DETAIL_READY_TIMEOUT_MS = 5000
+WEBSITE_GOTO_TIMEOUT_MS = 5000
+DETAIL_READY_TIMEOUT_MS = 3000
+FIELD_LOOKUP_TIMEOUT_MS = 900
 
 # Basic regex for email extraction
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
@@ -30,7 +31,7 @@ def is_place_url(url: str) -> bool:
     """Detect if the URL is for a single place listing."""
     return "/place/" in url or url.startswith("https://www.google.com/maps/place")
 
-def random_delay(min_sec: float = 1.0, max_sec: float = 3.0):
+def random_delay(min_sec: float = 0.3, max_sec: float = 0.9):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
@@ -125,7 +126,7 @@ def _dismiss_consent(page: Page):
             continue
 
 
-def _safe_text(page: Page, selectors: list, timeout: int = 3000) -> Optional[str]:
+def _safe_text(page: Page, selectors: list, timeout: int = FIELD_LOOKUP_TIMEOUT_MS) -> Optional[str]:
     """Try multiple selectors in order, return the text of the first visible one."""
     for sel in selectors:
         try:
@@ -139,7 +140,7 @@ def _safe_text(page: Page, selectors: list, timeout: int = 3000) -> Optional[str
     return None
 
 
-def _safe_attr(page: Page, selectors: list, attr: str, timeout: int = 3000) -> Optional[str]:
+def _safe_attr(page: Page, selectors: list, attr: str, timeout: int = FIELD_LOOKUP_TIMEOUT_MS) -> Optional[str]:
     """Try multiple selectors in order, return an attribute of the first visible one."""
     for sel in selectors:
         try:
@@ -319,7 +320,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         logger.warning(f"Timeout loading list view for {url}. Proceding.")
     
     # Minimal delay for JS to start rendering
-    random_delay(1.5, 2.5)
+    random_delay(0.4, 0.8)
 
     # Dismiss consent dialogs (common on server IPs)
     _dismiss_consent(page)
@@ -381,14 +382,14 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             # Fallback: scroll the whole window
             page.evaluate("window.scrollBy(0, 1500)")
             
-        random_delay(1.0, 2.0)
+        random_delay(0.4, 0.8)
         
         # Check for pagination "Next" button in some versions
         next_btn = page.locator("button[aria-label*='Next page'], a[aria-label*='Next page']").first
         if next_btn.is_visible(timeout=500):
             try:
                 next_btn.click()
-                random_delay(2, 3)
+                random_delay(0.8, 1.2)
             except Exception:
                 pass
 
@@ -413,7 +414,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             if consecutive_detail_failures >= 3:
                 logger.error("Multiple consecutive detail failures; stopping to avoid prolonged timeouts.")
                 break
-        random_delay(0.4, 1.1)
+        random_delay(0.2, 0.5)
 
     try:
         detail_page.close()
