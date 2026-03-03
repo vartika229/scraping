@@ -17,12 +17,16 @@ logger = logging.getLogger(__name__)
 
 # Timeouts tuned for cloud/server reliability. Keeping them too high causes
 # linear blow-ups when scraping many listings.
-LIST_GOTO_TIMEOUT_MS = 20000
-DETAIL_GOTO_TIMEOUT_MS = 12000
-DETAIL_RETRY_TIMEOUT_MS = 6000
+LIST_GOTO_TIMEOUT_MS = 12000
+DETAIL_GOTO_TIMEOUT_MS = 5000
+DETAIL_RETRY_TIMEOUT_MS = 2200
 WEBSITE_GOTO_TIMEOUT_MS = 5000
-DETAIL_READY_TIMEOUT_MS = 3000
-FIELD_LOOKUP_TIMEOUT_MS = 900
+DETAIL_READY_TIMEOUT_MS = 1200
+FIELD_LOOKUP_TIMEOUT_MS = 120
+
+# Keep extraction snappy and bounded. If a listing takes too long to render,
+# return best-effort fields and move on to the next one.
+MAX_DETAIL_BUDGET_S = 1.7
 
 # Basic regex for email extraction
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
@@ -31,7 +35,7 @@ def is_place_url(url: str) -> bool:
     """Detect if the URL is for a single place listing."""
     return "/place/" in url or url.startswith("https://www.google.com/maps/place")
 
-def random_delay(min_sec: float = 0.3, max_sec: float = 0.9):
+def random_delay(min_sec: float = 0.08, max_sec: float = 0.2):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
@@ -62,6 +66,24 @@ def normalize_place_url(raw_url: str) -> Optional[str]:
         return f"{base_url}?cid={cid}"
 
     return base_url
+
+
+def _collect_place_links(page: Page) -> List[str]:
+    """Fast link collection using in-page DOM query (avoids many handle round-trips)."""
+    try:
+        hrefs = page.evaluate(
+            """() => Array.from(
+                document.querySelectorAll("a[href*='/maps/place/'], a.hfpxzc, a[data-clear-ad-type-id]")
+            ).map(a => a.getAttribute('href')).filter(Boolean)"""
+        )
+    except Exception:
+        return []
+    normalized = []
+    for href in hrefs:
+        n = normalize_place_url(href)
+        if n:
+            normalized.append(n)
+    return normalized
 
 def extract_email_from_website(page: Page, website_url: str) -> Optional[str]:
     if not website_url or pd.isna(website_url):
@@ -169,6 +191,8 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
         "Google Maps URL": url
     }
 
+    started = time.perf_counter()
+
     for attempt in range(1, 3):
         try:
             page.goto(
@@ -186,7 +210,10 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 
     # Handle consent dialogs
     _dismiss_consent(page)
-    random_delay(0.5, 1.0)
+    random_delay(0.05, 0.12)
+
+    def budget_exceeded() -> bool:
+        return (time.perf_counter() - started) >= MAX_DETAIL_BUDGET_S
 
     # Wait for some detail indicator to be present
     try:
@@ -196,6 +223,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
             return data
 
     # ── Company Name ──────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Company Name"] = _safe_text(page, [
         "h1.DUwDvf",
         "h1[data-attrid='title']",
@@ -204,6 +234,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     ])
 
     # ── Rating ────────────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Rating"] = _safe_text(page, [
         "div.F7nice > span > span[aria-hidden='true']",
         "div.F7nice span[aria-hidden='true']",
@@ -213,7 +246,7 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     if not data["Rating"]:
         try:
             role_img = page.locator("span[role='img'][aria-label*='stars']").first
-            if role_img.is_visible(timeout=2000):
+            if role_img.is_visible(timeout=150):
                 label = role_img.get_attribute("aria-label") or ""
                 m = re.search(r'([\d.]+)\s*stars?', label, re.IGNORECASE)
                 if m:
@@ -223,6 +256,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
 
     # ── Review Count ──────────────────────────────────────
     try:
+        if budget_exceeded():
+            return data
+
         reviews_text = _safe_text(page, [
             "div.F7nice span[aria-label*='reviews']",
             "div.F7nice span[aria-label*='Reviews']",
@@ -239,7 +275,7 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     if not data["Review Count"]:
         try:
             role_img = page.locator("span[role='img'][aria-label*='reviews']").first
-            if role_img.is_visible(timeout=2000):
+            if role_img.is_visible(timeout=150):
                 label = role_img.get_attribute("aria-label") or ""
                 m = re.search(r'([\d,]+)\s*reviews?', label, re.IGNORECASE)
                 if m:
@@ -248,6 +284,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
             pass
 
     # ── Category ──────────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Category"] = _safe_text(page, [
         "button.DkEaL",
         "button[jsaction*='category']",
@@ -257,6 +296,9 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     ])
 
     # ── Address ───────────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Address"] = _safe_text(page, [
         "button[data-item-id='address'] div.Io6YTe",
         "button[data-item-id='address'] .rogA2c",
@@ -268,13 +310,16 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     if not data["Address"]:
         try:
             addr_btn = page.locator("button[aria-label^='Address:'], [data-item-id='address']").first
-            if addr_btn.is_visible(timeout=1000):
+            if addr_btn.is_visible(timeout=150):
                 label = addr_btn.get_attribute("aria-label") or ""
                 data["Address"] = label.replace("Address:", "").strip()
         except Exception:
             pass
 
     # ── Phone Number ──────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Phone Number"] = _safe_text(page, [
         "button[data-item-id^='phone:tel:'] div.Io6YTe",
         "button[data-item-id^='phone:tel:'] .rogA2c",
@@ -286,13 +331,16 @@ def extract_place_details(page: Page, url: str, extract_email: bool = False) -> 
     if not data["Phone Number"]:
         try:
             phone_btn = page.locator("button[aria-label^='Phone:']").first
-            if phone_btn.is_visible(timeout=1000):
+            if phone_btn.is_visible(timeout=150):
                 label = phone_btn.get_attribute("aria-label") or ""
                 data["Phone Number"] = label.replace("Phone:", "").strip()
         except Exception:
             pass
 
     # ── Website ───────────────────────────────────────────
+    if budget_exceeded():
+        return data
+
     data["Website"] = _safe_attr(page, [
         "a[data-item-id='authority']",
         "a[aria-label^='Website:']",
@@ -320,14 +368,14 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
         logger.warning(f"Timeout loading list view for {url}. Proceding.")
     
     # Minimal delay for JS to start rendering
-    random_delay(0.4, 0.8)
+    random_delay(0.08, 0.2)
 
     # Dismiss consent dialogs (common on server IPs)
     _dismiss_consent(page)
 
     # Wait for at least one result link or a listing container (up to 15s)
     try:
-        page.locator("a[href*='/maps/place/'], a.hfpxzc, [role='article'], div.search-result").first.wait_for(state="visible", timeout=15000)
+        page.locator("a[href*='/maps/place/'], a.hfpxzc, [role='article'], div.search-result").first.wait_for(state="visible", timeout=7000)
     except Exception:
         if is_robot_check(page):
             logger.error("Scraping blocked by Google Robot check.")
@@ -345,20 +393,15 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
 
     while len(places) < max_results and scroll_cycles < max_scroll_cycles:
         scroll_cycles += 1
-        # Get all links matching a place URL (works in both rich and lite modes)        
-        links = page.locator("a[href*='/maps/place/'], a.hfpxzc, a[data-clear-ad-type-id]").all()
-        
-        for link in links:
-            try:
-                href = link.get_attribute("href")
-                normalized_url = normalize_place_url(href)
-                if normalized_url and normalized_url not in processed_urls:
-                    processed_urls.add(normalized_url)
-                    places.append(normalized_url)
-                    if len(places) >= max_results:
-                        break
-            except Exception:
-                continue
+        # Get links in one evaluate call for better throughput.
+        links = _collect_place_links(page)
+
+        for normalized_url in links:
+            if normalized_url not in processed_urls:
+                processed_urls.add(normalized_url)
+                places.append(normalized_url)
+                if len(places) >= max_results:
+                    break
         
         if len(places) >= max_results:
             break
@@ -382,14 +425,14 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             # Fallback: scroll the whole window
             page.evaluate("window.scrollBy(0, 1500)")
             
-        random_delay(0.4, 0.8)
+        random_delay(0.08, 0.2)
         
         # Check for pagination "Next" button in some versions
         next_btn = page.locator("button[aria-label*='Next page'], a[aria-label*='Next page']").first
         if next_btn.is_visible(timeout=500):
             try:
                 next_btn.click()
-                random_delay(0.8, 1.2)
+                random_delay(0.1, 0.25)
             except Exception:
                 pass
 
@@ -414,7 +457,7 @@ def scrape_search_results(page: Page, url: str, max_results: int = 20, extract_e
             if consecutive_detail_failures >= 3:
                 logger.error("Multiple consecutive detail failures; stopping to avoid prolonged timeouts.")
                 break
-        random_delay(0.2, 0.5)
+        random_delay(0.03, 0.09)
 
     try:
         detail_page.close()
