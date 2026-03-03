@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 jobs = {}
 jobs_lock = threading.Lock()
 JOB_TTL_SECONDS = 3600
+JOB_MAX_RUNTIME_SECONDS = 300
 
 
 @app.route("/")
@@ -81,7 +82,7 @@ def scrape():
     job_id = str(uuid.uuid4())
     _cleanup_jobs()
     with jobs_lock:
-        jobs[job_id] = {"status": "running", "results": None, "error": None, "updated_at": time.time()}
+        jobs[job_id] = {"status": "running", "results": None, "error": None, "started_at": time.time(), "updated_at": time.time()}
 
     thread = threading.Thread(target=_run_job, args=(job_id, url, max_results, extract_email), daemon=True)
     thread.start()
@@ -95,6 +96,19 @@ def job_status(job_id):
         job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
+
+    if job.get("status") == "running":
+        started_at = job.get("started_at", time.time())
+        if time.time() - started_at > JOB_MAX_RUNTIME_SECONDS:
+            with jobs_lock:
+                if jobs.get(job_id, {}).get("status") == "running":
+                    jobs[job_id]["status"] = "error"
+                    jobs[job_id]["error"] = (
+                        "Scrape exceeded maximum runtime. Try fewer results or disable email extraction."
+                    )
+                    jobs[job_id]["updated_at"] = time.time()
+            with jobs_lock:
+                job = jobs.get(job_id)
     return jsonify(job)
 
 
