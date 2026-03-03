@@ -523,7 +523,6 @@
             </div>
         </section>
 
-        <div class="footer">&copy; 2026 Google Maps Scraper &mdash; For educational purposes only.</div>
     </div>
 
     <script>
@@ -582,38 +581,97 @@
 
         async function pollJob(jobId, btn, spinner) {
             const spinnerText = document.getElementById('spinner-text');
-            let elapsed = 0;
-            const interval = setInterval(async () => {
-                elapsed += 2;
+            const maxPollingSeconds = 180;
+            const pollIntervalMs = 2500;
+            const fetchTimeoutMs = 8000;
+            const maxTransientFailures = 5;
+
+            const startedAt = Date.now();
+            let transientFailures = 0;
+            let stopped = false;
+
+            const stopPollingWithError = (message) => {
+                if (stopped) return;
+                stopped = true;
+                btn.disabled = false;
+                spinner.classList.remove('visible');
+                showBanner(message, 'error');
+            };
+
+            const stopPollingWithSuccess = (results) => {
+                if (stopped) return;
+                stopped = true;
+                btn.disabled = false;
+                spinner.classList.remove('visible');
+                if (results && results.length > 0) {
+                    lastResults = results;
+                    renderTable(results);
+                    showBanner(`Successfully scraped ${results.length} result(s).`, 'success');
+                } else {
+                    showBanner('Scraping completed but no results were found.', 'error');
+                }
+            };
+
+            const pollOnce = async () => {
+                if (stopped) return;
+
+                const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+                if (elapsed > maxPollingSeconds) {
+                    stopPollingWithError('Scraping is taking too long and was stopped. Try fewer results or disable email extraction.');
+                    return;
+                }
+
                 spinnerText.textContent = `Scraping in progress... (${elapsed}s)`;
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), fetchTimeoutMs);
+
                 try {
-                    const res = await fetch(API_BASE + '/status/' + jobId);
+                    const res = await fetch(API_BASE + '/status/' + jobId, { signal: controller.signal });
+
+                    if (!res.ok) {
+                        if (res.status === 502 || res.status === 503 || res.status === 504) {
+                            transientFailures += 1;
+                            if (transientFailures <= maxTransientFailures) {
+                                spinnerText.textContent = `Backend warming up... retrying (${transientFailures}/${maxTransientFailures})`;
+                                setTimeout(pollOnce, pollIntervalMs);
+                                return;
+                            }
+                            stopPollingWithError('Backend is temporarily unavailable (gateway error). Please retry in a few seconds.');
+                            return;
+                        }
+                        stopPollingWithError(`Polling failed with HTTP ${res.status}.`);
+                        return;
+                    }
+
+                    transientFailures = 0;
                     const data = await res.json();
 
                     if (data.status === 'done') {
-                        clearInterval(interval);
-                        btn.disabled = false;
-                        spinner.classList.remove('visible');
-                        if (data.results && data.results.length > 0) {
-                            lastResults = data.results;
-                            renderTable(data.results);
-                            showBanner(`Successfully scraped ${data.results.length} result(s).`, 'success');
-                        } else {
-                            showBanner('Scraping completed but no results were found.', 'error');
-                        }
-                    } else if (data.status === 'error') {
-                        clearInterval(interval);
-                        btn.disabled = false;
-                        spinner.classList.remove('visible');
-                        showBanner('Error: ' + (data.error || 'Unknown error'), 'error');
+                        stopPollingWithSuccess(data.results || []);
+                        return;
+                    }
+                    if (data.status === 'error') {
+                        stopPollingWithError('Error: ' + (data.error || 'Unknown error'));
+                        return;
                     }
                 } catch (e) {
-                    clearInterval(interval);
-                    btn.disabled = false;
-                    spinner.classList.remove('visible');
-                    showBanner('Polling error: ' + e.message, 'error');
+                    transientFailures += 1;
+                    if (transientFailures <= maxTransientFailures) {
+                        spinnerText.textContent = `Temporary network issue... retrying (${transientFailures}/${maxTransientFailures})`;
+                        setTimeout(pollOnce, pollIntervalMs);
+                        return;
+                    }
+                    stopPollingWithError('Polling error: ' + e.message);
+                    return;
+                } finally {
+                    clearTimeout(timeoutId);
                 }
-            }, 2000);
+
+                setTimeout(pollOnce, pollIntervalMs);
+            };
+
+            pollOnce();
         }
 
         function escapeHtml(value) {
